@@ -7,9 +7,11 @@ import argparse
 import http.client
 import ipaddress
 import os
+import socket
 import ssl
 import stat
 import subprocess
+import threading
 import time
 import urllib.parse
 from http import HTTPStatus
@@ -19,6 +21,9 @@ from typing import Optional
 
 
 MAX_REQUEST_BODY_BYTES = 24 * 1024 * 1024
+MAX_KEEPALIVE_REQUESTS = 100
+CLIENT_IDLE_TIMEOUT_SECONDS = 15
+NETWORK_CHECK_INTERVAL_SECONDS = 1
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -85,11 +90,13 @@ class HotspotProxyServer(ThreadingHTTPServer):
         self.upstream = upstream
         self.allowed_hosts = allowed_hosts
         self.tls_context = tls_context
+        self._connections: set = set()
+        self._connections_lock = threading.Lock()
         super().__init__(address, HotspotProxyHandler)
 
     def get_request(self):
         raw_socket, client_address = super().get_request()
-        raw_socket.settimeout(15)
+        raw_socket.settimeout(CLIENT_IDLE_TIMEOUT_SECONDS)
         try:
             tls_socket = self.tls_context.wrap_socket(
                 raw_socket,
@@ -102,12 +109,38 @@ class HotspotProxyServer(ThreadingHTTPServer):
         # The handler thread performs the TLS handshake on its first read. This
         # keeps one slow mobile connection from blocking other parallel browser
         # asset requests in the main accept loop.
+        with self._connections_lock:
+            self._connections.add(tls_socket)
         return tls_socket, client_address
+
+    def shutdown_request(self, request) -> None:
+        with self._connections_lock:
+            self._connections.discard(request)
+        super().shutdown_request(request)
+
+    def server_close(self) -> None:
+        # Closing only the listener would leave keep-alive clients connected
+        # after a hotspot/interface change. Retire those sockets as well.
+        with self._connections_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.shutdown_request(connection)
+        super().server_close()
 
 
 class HotspotProxyHandler(BaseHTTPRequestHandler):
     server: HotspotProxyServer
     protocol_version = "HTTP/1.1"
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(CLIENT_IDLE_TIMEOUT_SECONDS)
+        self._request_count = 0
 
     def log_message(self, format: str, *args: object) -> None:
         # Keep logs metadata-only. Authorization and request bodies are never logged.
@@ -121,8 +154,11 @@ class HotspotProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
         self.close_connection = True
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass
 
     def _valid_host(self) -> bool:
         supplied = self.headers.get("Host", "")
@@ -134,6 +170,7 @@ class HotspotProxyHandler(BaseHTTPRequestHandler):
         return hostname.lower() in self.server.allowed_hosts
 
     def _proxy(self) -> None:
+        self._request_count += 1
         if not self._valid_host():
             self._send_error_json(HTTPStatus.BAD_REQUEST, "invalid_host")
             return
@@ -144,19 +181,40 @@ class HotspotProxyHandler(BaseHTTPRequestHandler):
                 "streaming_request_not_supported",
             )
             return
+        lengths = self.headers.get_all("Content-Length", [])
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            if len(lengths) > 1:
+                raise ValueError("ambiguous content length")
+            raw_length = lengths[0] if lengths else "0"
+            if not raw_length.isascii() or not raw_length.isdecimal():
+                raise ValueError("invalid content length")
+            length = int(raw_length)
         except ValueError:
             self._send_error_json(HTTPStatus.BAD_REQUEST, "invalid_content_length")
             return
         if length < 0 or length > MAX_REQUEST_BODY_BYTES:
             self._send_error_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request_too_large")
             return
-        body = self.rfile.read(length) if length else None
+        try:
+            body = self.rfile.read(length) if length else None
+        except (OSError, TimeoutError):
+            self._send_error_json(HTTPStatus.REQUEST_TIMEOUT, "request_body_timeout")
+            return
+        if body is not None and len(body) != length:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "incomplete_request_body")
+            return
+        connection_headers = {
+            token.strip().lower()
+            for value in self.headers.get_all("Connection", [])
+            for token in value.split(",")
+        }
+        if "close" in connection_headers:
+            self.close_connection = True
         forwarded_headers = {
             name: value
             for name, value in self.headers.items()
             if name.lower() not in HOP_BY_HOP_HEADERS
+            and name.lower() not in connection_headers
             and name.lower() not in {"host", "content-length"}
         }
         forwarded_headers["Host"] = (
@@ -179,18 +237,26 @@ class HotspotProxyHandler(BaseHTTPRequestHandler):
         finally:
             connection.close()
         self.send_response(response.status, response.reason)
+        response_connection_headers = {
+            token.strip().lower()
+            for token in response.getheader("Connection", "").split(",")
+        }
         for name, value in response.getheaders():
-            if name.lower() in HOP_BY_HOP_HEADERS or name.lower() == "content-length":
+            if (name.lower() in HOP_BY_HOP_HEADERS
+                    or name.lower() in response_connection_headers
+                    or name.lower() == "content-length"):
                 continue
             self.send_header(name, value)
         self.send_header("Content-Length", str(len(response_body)))
-        self.send_header("Connection", "close")
+        if self._request_count >= MAX_KEEPALIVE_REQUESTS:
+            self.close_connection = True
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         try:
             self.wfile.write(response_body)
         except (BrokenPipeError, ConnectionResetError):
-            pass
-        self.close_connection = True
+            self.close_connection = True
 
     do_GET = _proxy
     do_POST = _proxy
@@ -249,6 +315,18 @@ def hotspot_matches(args: argparse.Namespace) -> bool:
     return gateway == args.expected_gateway and interface == args.expected_interface
 
 
+def serve_hotspot_requests(server, args: argparse.Namespace) -> None:
+    """Poll topology on a time budget, independent of HTTP connection volume."""
+    next_check = 0.0
+    while True:
+        now = time.monotonic()
+        if now >= next_check:
+            if not hotspot_matches(args):
+                return
+            next_check = now + NETWORK_CHECK_INTERVAL_SECONDS
+        server.handle_request()
+
+
 def serve_when_hotspot_matches(args: argparse.Namespace) -> None:
     while True:
         if not hotspot_matches(args):
@@ -265,14 +343,13 @@ def serve_when_hotspot_matches(args: argparse.Namespace) -> None:
             print(f"hotspot proxy waiting for {args.listen_host}: {error}", flush=True)
             time.sleep(3)
             continue
-        server.timeout = 2
+        server.timeout = NETWORK_CHECK_INTERVAL_SECONDS
         print(
             f"hotspot proxy listening on https://{args.listen_host}:{args.port}",
             flush=True,
         )
         try:
-            while hotspot_matches(args):
-                server.handle_request()
+            serve_hotspot_requests(server, args)
         finally:
             server.server_close()
             print("hotspot proxy paused because the network changed", flush=True)

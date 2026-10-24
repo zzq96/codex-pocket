@@ -72,7 +72,7 @@ For long-running remote use while a MacBook is locked or closed, we recommend th
 ## Install
 
 ```sh
-git clone https://github.com/JarvisPei/codex-pocket.git
+git clone https://github.com/zzq96/codex-pocket.git
 cd codex-pocket
 zsh scripts/install-mac-bridge-launch-agent.sh
 ```

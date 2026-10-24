@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -11,13 +12,24 @@ import sqlite3
 import subprocess
 import threading
 import time
+from collections import OrderedDict, deque
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
 
 _ROLLOUT_ACTIVITY_LOCK = threading.Lock()
-_ROLLOUT_ACTIVITY_CACHE: dict[str, dict[str, Any]] = {}
+_ROLLOUT_ACTIVITY_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+# The sidebar reads up to 50 tasks in a fixed order. A smaller cache causes
+# every refresh to evict the next task before it can reuse its file offset.
+ROLLOUT_ACTIVITY_CACHE_ENTRIES = 128
+ROLLOUT_ACTIVITY_MAX_TURNS = 256
+ROLLOUT_ACTIVITY_MAX_RECORD_BYTES = 4 * 1024 * 1024
+HISTORY_MAX_ITEMS = 200
+_RECOVERABLE_CATALOG_METHODS = frozenset({
+    "thread/list", "thread/read", "thread/turns/list", "thread/loaded/list",
+    "model/list", "account/rateLimits/read", "config/read",
+})
 _PROJECT_STATE_LOCK = threading.Lock()
 _READ_ONLY_COMMAND = re.compile(
     r"^(?:/[^\s]+/)?(?:rg|grep|find|ls|pwd|head|tail|wc|stat|file)\b"
@@ -28,6 +40,10 @@ _READ_ONLY_COMMAND = re.compile(
 
 class AppServerError(RuntimeError):
     pass
+
+
+class AppServerTransportError(AppServerError):
+    """The stdio transport is unavailable; a write outcome may be unknown."""
 
 
 class AppServerRejected(AppServerError):
@@ -52,9 +68,18 @@ class CodexAppServerClient:
         self._process: Optional[subprocess.Popen[str]] = None
         self._reader: Optional[threading.Thread] = None
         self._pending: dict[int, queue.Queue[dict[str, Any]]] = {}
+        self._pending_generations: dict[int, int] = {}
         self._pending_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._close_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._transport_state_lock = threading.Lock()
+        self._generation = 0
+        self._ready = threading.Event()
+        self._transport_failed = threading.Event()
+        self._recovering = threading.Event()
+        self._catalog_failures = 0
+        self._catalog_retry_at = 0.0
         self._managed_lock = threading.Lock()
         self._settings_lock = threading.RLock()
         self._managed_runs: dict[str, dict[str, Any]] = {}
@@ -71,80 +96,136 @@ class CodexAppServerClient:
         self._retirement: Optional[threading.Thread] = None
         self._history_paging_supported: Optional[bool] = None
 
-    def start(self) -> None:
-        if self._process is not None:
-            return
-        try:
-            self._process = subprocess.Popen(
-                # Stdio is the default transport, including native Windows.
-                [str(self.codex_binary), "app-server"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                bufsize=1,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except OSError as error:
-            raise AppServerError("Unable to start Codex app-server.") from error
-        self._reader = threading.Thread(
-            target=self._read_loop,
-            name="codex-app-server-reader",
-            daemon=True,
-        )
-        self._reader.start()
-        try:
-            self.request(
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "mobile_codex_desktop_mac",
-                        "title": "Codex Pocket Bridge",
-                        "version": "0.2.0",
-                    },
-                    "capabilities": {"experimentalApi": True},
-                },
-            )
-            self.notify("initialized", {})
-        except Exception:
-            self.close()
-            raise
-
-    def _read_loop(self) -> None:
+    def is_ready(self) -> bool:
+        """Readiness is observational: it never starts a process or waits on RPC."""
         process = self._process
+        return bool(not self._closed and self._ready.is_set()
+                    and not self._transport_failed.is_set()
+                    and process is not None and process.poll() is None)
+
+    def transport_status(self) -> dict[str, Any]:
+        ready = self.is_ready()
+        state = ("closed" if self._closed else "ready" if ready
+                 else "recovering" if self._recovering.is_set() else "unavailable")
+        return {"ready": ready, "state": state,
+                "retryAfterSeconds": max(0.0, self._catalog_retry_at - time.monotonic())}
+
+    def start(self) -> None:
+        with self._lifecycle_lock:
+            if self._closed:
+                raise AppServerError("Codex app-server client is closed.")
+            if self.is_ready():
+                return
+            self._recovering.set()
+            try:
+                # Only replace this transport. The parent also owns independent
+                # background writers, which must survive a catalog restart.
+                if self._process is not None:
+                    self._stop_transport(force=True)
+                with self._transport_state_lock:
+                    self._generation += 1
+                    generation = self._generation
+                    self._ready.clear()
+                    self._transport_failed.clear()
+                self._history_paging_supported = None
+                try:
+                    process = subprocess.Popen(
+                        [str(self.codex_binary), "app-server"],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except OSError as error:
+                    raise AppServerError("Unable to start Codex app-server.") from error
+                with self._transport_state_lock:
+                    self._process = process
+                self._reader = threading.Thread(
+                    target=self._read_loop, args=(process, generation),
+                    name="codex-app-server-reader", daemon=True,
+                )
+                self._reader.start()
+                self._request_once("initialize", {
+                    "clientInfo": {"name": "mobile_codex_desktop_mac",
+                                   "title": "Codex Pocket Bridge", "version": "0.2.0"},
+                    "capabilities": {"experimentalApi": True},
+                })
+                self.notify("initialized", {})
+                with self._transport_state_lock:
+                    if self._transport_failed.is_set() or process.poll() is not None:
+                        raise AppServerError("Codex app-server connection closed during initialization.")
+                    self._ready.set()
+                self._catalog_failures = 0
+                self._catalog_retry_at = 0.0
+            except Exception:
+                self._stop_transport(force=True)
+                self._catalog_failures += 1
+                self._catalog_retry_at = time.monotonic() + min(30, 2 ** min(self._catalog_failures - 1, 5))
+                raise
+            finally:
+                self._recovering.clear()
+
+    def _recover_catalog(self) -> None:
+        with self._lifecycle_lock:
+            if self._closed or self._dedicated:
+                raise AppServerError("Codex app-server transport cannot be recovered.")
+            if self.is_ready():
+                return  # Another caller already replaced the failed generation.
+            if time.monotonic() < self._catalog_retry_at:
+                raise AppServerError("Codex app-server recovery is backing off.")
+            self.start()
+
+    def _read_loop(self, process=None, generation: Optional[int] = None) -> None:
+        process = process if process is not None else self._process
+        generation = self._generation if generation is None else generation
         if process is None or process.stdout is None:
             return
-        for line in process.stdout:
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(message, dict):
-                continue
-            method = message.get("method")
-            if isinstance(method, str):
-                if "id" in message:
-                    self._handle_server_request(message)
-                else:
-                    self._handle_notification(method, message.get("params"))
-                continue
-            request_id = message.get("id")
-            if not isinstance(request_id, int):
-                continue
-            with self._pending_lock:
-                response_queue = self._pending.get(request_id)
-            if response_queue is not None:
-                response_queue.put(message)
-        self._fail_pending("Codex app-server connection closed.")
-        if not self._closed:
-            with self._managed_lock:
-                for run in self._managed_runs.values():
-                    if self._is_active_status(run.get("status")):
-                        run["status"] = "failed"
-                        run["error"] = "Codex app-server connection closed."
-                        run["pendingRequest"] = None
-                        self._touch_run(run)
+        try:
+            for line in process.stdout:
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                if generation != self._generation or process is not self._process:
+                    continue
+                method = message.get("method")
+                if isinstance(method, str):
+                    if "id" in message:
+                        self._handle_server_request(message, generation=generation)
+                    else:
+                        self._handle_notification(method, message.get("params"))
+                    continue
+                request_id = message.get("id")
+                if not isinstance(request_id, int):
+                    continue
+                with self._pending_lock:
+                    response_queue = (self._pending.get(request_id)
+                                      if self._pending_generations.get(request_id) == generation else None)
+                if response_queue is not None:
+                    try:
+                        response_queue.put_nowait(message)
+                    except queue.Full:
+                        pass  # A duplicate reply must not stall the stdout reader.
+        except (OSError, ValueError, UnicodeError, AppServerError):
+            pass  # A broken/closed stream follows the same generation-scoped EOF path.
+        finally:
+            with self._transport_state_lock:
+                current = generation == self._generation and process is self._process
+                if current:
+                    self._ready.clear()
+                    self._transport_failed.set()
+            # Publish failure before waking callers, or an EOF while the child
+            # is still alive could be mistaken for a healthy catalog transport.
+            self._fail_pending("Codex app-server connection closed.", generation=generation)
+            if current and not self._closed:
+                with self._managed_lock:
+                    for run in self._managed_runs.values():
+                        if self._is_active_status(run.get("status")):
+                            run["status"] = "failed"
+                            run["error"] = "Codex app-server connection closed."
+                            run["pendingRequest"] = None
+                            self._touch_run(run)
 
     @staticmethod
     def _is_active_status(status: Any) -> bool:
@@ -314,7 +395,15 @@ class CodexAppServerClient:
             }
         return None
 
-    def _handle_server_request(self, message: dict[str, Any]) -> None:
+    def _handle_server_request(
+        self, message: dict[str, Any], *, generation: Optional[int] = None,
+    ) -> None:
+        def respond(reply: dict[str, Any]) -> None:
+            if generation is None:
+                self._write(reply)
+            else:
+                self._write(reply, generation=generation)
+
         method = message.get("method")
         params = message.get("params")
         request_id = message.get("id")
@@ -322,7 +411,7 @@ class CodexAppServerClient:
             return
         thread_id = params.get("threadId")
         if not isinstance(thread_id, str):
-            self._write(
+            respond(
                 {
                     "id": request_id,
                     "error": {"code": -32602, "message": "threadId is required"},
@@ -332,7 +421,7 @@ class CodexAppServerClient:
         key = secrets.token_urlsafe(12)
         safe_request = self._safe_server_request(key, method, params)
         if safe_request is None:
-            self._write(
+            respond(
                 {
                     "id": request_id,
                     "error": {
@@ -345,7 +434,7 @@ class CodexAppServerClient:
         with self._managed_lock:
             run = self._managed_runs.get(thread_id)
             if run is None:
-                self._write(
+                respond(
                     {
                         "id": request_id,
                         "error": {"code": -32600, "message": "Thread is not managed"},
@@ -362,31 +451,42 @@ class CodexAppServerClient:
             run["status"] = "waitingForInput"
             self._touch_run(run)
 
-    def _fail_pending(self, message: str) -> None:
+    def _fail_pending(self, message: str, *, generation: Optional[int] = None) -> None:
         with self._pending_lock:
-            pending = list(self._pending.values())
+            pending = [response for request_id, response in self._pending.items()
+                       if generation is None or self._pending_generations.get(request_id) == generation]
         for response_queue in pending:
             try:
                 response_queue.put_nowait({"transportError": message})
             except queue.Full:
                 pass  # A valid RPC response is already waiting for its caller.
 
-    def _write(self, message: dict[str, Any]) -> None:
-        process = self._process
-        if (
-            process is None
-            or process.poll() is not None
-            or process.stdin is None
-            or self._closed
-        ):
-            raise AppServerError("Codex app-server is not running.")
+    def _write(self, message: dict[str, Any], *, generation: Optional[int] = None) -> None:
+        if generation is None and "method" in message and "id" in message:
+            with self._pending_lock:
+                generation = self._pending_generations.get(message["id"])
         encoded = json.dumps(message, separators=(",", ":"), ensure_ascii=False)
+        process = None
+        process_generation = None
         try:
             with self._write_lock:
+                with self._transport_state_lock:
+                    process = self._process
+                    process_generation = self._generation
+                    if (process is None or process.poll() is not None or process.stdin is None
+                            or self._closed or self._transport_failed.is_set()
+                            or (generation is not None and generation != self._generation)):
+                        raise AppServerTransportError("Codex app-server transport is not running.")
                 process.stdin.write(f"{encoded}\n")
                 process.stdin.flush()
-        except (BrokenPipeError, OSError) as error:
-            raise AppServerError("Codex app-server connection failed.") from error
+        except (BrokenPipeError, OSError, ValueError) as error:
+            with self._transport_state_lock:
+                if process is self._process and process_generation == self._generation:
+                    self._ready.clear()
+                    self._transport_failed.set()
+            if process_generation is not None:
+                self._fail_pending("Codex app-server connection failed.", generation=process_generation)
+            raise AppServerTransportError("Codex app-server connection failed.") from error
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
         self._write({"method": method, "params": params})
@@ -397,11 +497,31 @@ class CodexAppServerClient:
         params: dict[str, Any],
         timeout: float = 15,
     ) -> dict[str, Any]:
+        recoverable = not self._dedicated and method in _RECOVERABLE_CATALOG_METHODS
+        if recoverable and self._recovering.is_set():
+            self._recover_catalog()
+        try:
+            return self._request_once(method, params, timeout)
+        except AppServerTransportError:
+            if not recoverable or self._closed:
+                raise
+            self._recover_catalog()
+            # Only an explicitly read-only RPC is replayed, and only once.
+            # A live-process timeout or a write with an unknown outcome is not.
+            return self._request_once(method, params, timeout)
+
+    def _request_once(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float = 15,
+    ) -> dict[str, Any]:
         with self._pending_lock:
             request_id = self._next_id
             self._next_id += 1
             response_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
             self._pending[request_id] = response_queue
+            self._pending_generations[request_id] = self._generation
         try:
             self._write({"id": request_id, "method": method, "params": params})
             try:
@@ -411,6 +531,7 @@ class CodexAppServerClient:
         finally:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
+                self._pending_generations.pop(request_id, None)
         if "error" in response:
             error_payload = response.get("error")
             detail = (
@@ -423,7 +544,7 @@ class CodexAppServerClient:
                 error_payload.get("code") if isinstance(error_payload, dict) else None,
             )
         if "transportError" in response:
-            raise AppServerError(str(response["transportError"]))
+            raise AppServerTransportError(str(response["transportError"]))
         result = response.get("result")
         if not isinstance(result, dict):
             raise AppServerError(f"Codex app-server returned invalid data for {method}.")
@@ -931,16 +1052,34 @@ class CodexAppServerClient:
             self._close_process()
 
     def _close_process(self) -> None:
+        with self._lifecycle_lock:
+            self._closed = True
+            self._stop_transport()
         for writer in list(self._background_clients.values()):
             writer.close()
-        self._closed = True
-        process = self._process
+
+    def _stop_transport(self, *, force: bool = False) -> None:
+        """Close only this generation; never retire separately owned writers."""
+        with self._transport_state_lock:
+            process = self._process
+            reader = self._reader
+            generation = self._generation
+            self._process = None
+            self._reader = None
+            self._ready.clear()
+            self._transport_failed.set()
+        self._fail_pending("Codex app-server connection closed.", generation=generation)
         if process is None:
             return
+        if force and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
         if process.stdin is not None:
             try:
                 process.stdin.close()
-            except OSError:
+            except (OSError, ValueError):
                 pass
         try:
             process.wait(timeout=3)
@@ -951,11 +1090,10 @@ class CodexAppServerClient:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
-        if self._reader is not None and self._reader is not threading.current_thread():
-            self._reader.join(timeout=2)
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=2)
         if process.stdout is not None:
             process.stdout.close()
-        self._process = None
 
 
 def _read_saved_model_settings(thread_id: str) -> dict[str, str]:
@@ -1049,85 +1187,123 @@ def _activity_kinds_from_rollout_item(payload: dict[str, Any]) -> set[str]:
     return kinds
 
 
+def _empty_rollout_snapshot() -> dict[str, Any]:
+    return {"turns": {}, "activeTurnId": "", "activeStartedAt": None, "status": ""}
+
+
+def _reset_rollout_state(state: dict[str, Any], identity: tuple[int, int]) -> None:
+    state.update({
+        "identity": identity, "offset": 0, "observedSize": -1, "mtimeNs": None,
+        "currentTurn": "", "currentStartedAt": None, "lastStatus": "",
+        "counts": OrderedDict(),
+    })
+
+
+def _record_rollout_activity(state: dict[str, Any], record: Any) -> None:
+    if not isinstance(record, dict):
+        return
+    record_type = record.get("type")
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return
+    event_type = payload.get("type")
+    if record_type == "event_msg" and event_type == "task_started":
+        state["currentTurn"] = str(payload.get("turn_id", ""))
+        state["currentStartedAt"] = payload.get("started_at") or record.get("timestamp")
+        state["lastStatus"] = "inProgress"
+        return
+    if record_type == "event_msg" and event_type in {"task_complete", "turn_aborted"}:
+        if str(payload.get("turn_id", "")) == state["currentTurn"]:
+            state["currentTurn"] = ""
+            state["currentStartedAt"] = None
+        state["lastStatus"] = "completed" if event_type == "task_complete" else "interrupted"
+        return
+    if record_type != "response_item" or not state["currentTurn"]:
+        return
+    kinds = _activity_kinds_from_rollout_item(payload)
+    if not kinds:
+        return
+    counts = state["counts"]
+    turn_counts = counts.setdefault(state["currentTurn"], {})
+    counts.move_to_end(state["currentTurn"])
+    for kind in kinds:
+        turn_counts[kind] = int(turn_counts.get(kind, 0)) + 1
+    while len(counts) > ROLLOUT_ACTIVITY_MAX_TURNS:
+        counts.popitem(last=False)
+
+
 def _rollout_activity_snapshot(thread: dict[str, Any]) -> dict[str, Any]:
     thread_id = str(thread.get("id", ""))
     raw_path = thread.get("path")
     if not thread_id or not isinstance(raw_path, str):
-        return {"turns": {}, "activeTurnId": "", "activeStartedAt": None, "status": ""}
+        return _empty_rollout_snapshot()
     path = Path(raw_path)
-    if (
-        not path.is_absolute()
-        or path.suffix != ".jsonl"
-        or not path.name.endswith(f"-{thread_id}.jsonl")
-    ):
-        return {"turns": {}, "activeTurnId": "", "activeStartedAt": None, "status": ""}
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return {"turns": {}, "activeTurnId": "", "activeStartedAt": None, "status": ""}
+    if (not path.is_absolute() or path.suffix != ".jsonl"
+            or not path.name.endswith(f"-{thread_id}.jsonl")):
+        return _empty_rollout_snapshot()
     cache_key = str(path)
+    # Only directory bookkeeping holds the global lock. One large cold rollout
+    # must not prevent another task from reading its already-cached status.
     with _ROLLOUT_ACTIVITY_LOCK:
         state = _ROLLOUT_ACTIVITY_CACHE.get(cache_key)
-        if state is None or size < state["offset"]:
-            state = {
-                "offset": 0,
-                "currentTurn": "",
-                "currentStartedAt": None,
-                "lastStatus": "",
-                "counts": {},
-            }
+        if state is None:
+            state = {"lock": threading.Lock()}
+            _reset_rollout_state(state, (-1, -1))
             _ROLLOUT_ACTIVITY_CACHE[cache_key] = state
-        if size > state["offset"]:
-            try:
+        _ROLLOUT_ACTIVITY_CACHE.move_to_end(cache_key)
+        while len(_ROLLOUT_ACTIVITY_CACHE) > ROLLOUT_ACTIVITY_CACHE_ENTRIES:
+            _ROLLOUT_ACTIVITY_CACHE.popitem(last=False)
+    with state["lock"]:
+        try:
+            metadata = path.stat()
+            identity = (metadata.st_dev, metadata.st_ino)
+            size, mtime = metadata.st_size, metadata.st_mtime_ns
+            if (identity != state["identity"] or size < state["observedSize"]
+                    or (size == state["observedSize"] and mtime != state["mtimeNs"])):
+                _reset_rollout_state(state, identity)
+            changed = size != state["observedSize"] or mtime != state["mtimeNs"]
+            if changed and size > state["offset"]:
                 with path.open("rb") as handle:
+                    # An atomic replacement can happen between stat and open.
+                    opened = os.fstat(handle.fileno())
+                    opened_identity = (opened.st_dev, opened.st_ino)
+                    if (opened_identity != state["identity"]
+                            or opened.st_size < state["observedSize"]):
+                        _reset_rollout_state(state, opened_identity)
+                    size, mtime = opened.st_size, opened.st_mtime_ns
                     handle.seek(state["offset"])
-                    chunk = handle.read(size - state["offset"])
-            except OSError:
-                return {"turns": {}, "activeTurnId": "", "activeStartedAt": None, "status": ""}
-            final_newline = chunk.rfind(b"\n")
-            if final_newline >= 0:
-                complete = chunk[: final_newline + 1]
-                state["offset"] += final_newline + 1
-                for raw_line in complete.splitlines():
-                    try:
-                        record = json.loads(raw_line)
-                    except (UnicodeDecodeError, json.JSONDecodeError):
-                        continue
-                    record_type = record.get("type")
-                    payload = record.get("payload")
-                    if not isinstance(payload, dict):
-                        continue
-                    event_type = payload.get("type")
-                    if record_type == "event_msg" and event_type == "task_started":
-                        state["currentTurn"] = str(payload.get("turn_id", ""))
-                        state["currentStartedAt"] = payload.get("started_at") or record.get("timestamp")
-                        state["lastStatus"] = "inProgress"
-                        continue
-                    if record_type == "event_msg" and event_type in {
-                        "task_complete", "turn_aborted",
-                    }:
-                        if str(payload.get("turn_id", "")) == state["currentTurn"]:
-                            state["currentTurn"] = ""
-                            state["currentStartedAt"] = None
-                        state["lastStatus"] = (
-                            "completed" if event_type == "task_complete" else "interrupted"
-                        )
-                        continue
-                    if record_type != "response_item" or not state["currentTurn"]:
-                        continue
-                    kinds = _activity_kinds_from_rollout_item(payload)
-                    if not kinds:
-                        continue
-                    turn_counts = state["counts"].setdefault(state["currentTurn"], {})
-                    for kind in kinds:
-                        turn_counts[kind] = int(turn_counts.get(kind, 0)) + 1
-        while len(_ROLLOUT_ACTIVITY_CACHE) > 8:
-            _ROLLOUT_ACTIVITY_CACHE.pop(next(iter(_ROLLOUT_ACTIVITY_CACHE)))
+                    position = state["offset"]
+                    while position < size:
+                        raw_line = handle.readline(min(ROLLOUT_ACTIVITY_MAX_RECORD_BYTES + 1,
+                                                       size - position))
+                        position += len(raw_line)
+                        oversized = len(raw_line) > ROLLOUT_ACTIVITY_MAX_RECORD_BYTES
+                        # Tool results can contain huge single-line blobs. Skip
+                        # these in bounded pieces, still recognizing later events.
+                        while (raw_line and not raw_line.endswith(b"\n") and position < size
+                               and (oversized or len(raw_line) >= ROLLOUT_ACTIVITY_MAX_RECORD_BYTES)):
+                            oversized = True
+                            raw_line = handle.readline(min(ROLLOUT_ACTIVITY_MAX_RECORD_BYTES,
+                                                           size - position))
+                            position += len(raw_line)
+                        if not raw_line.endswith(b"\n"):
+                            # A writer may be midway through a JSONL record.
+                            # Commit only complete lines and revisit this offset
+                            # once the file changes, not on every unchanged poll.
+                            break
+                        state["offset"] = position
+                        if oversized:
+                            continue
+                        try:
+                            record = json.loads(raw_line)
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            continue
+                        _record_rollout_activity(state, record)
+            state["observedSize"], state["mtimeNs"] = size, mtime
+        except OSError:
+            return _empty_rollout_snapshot()
         return {
-            "turns": {
-                turn_id: dict(counts)
-                for turn_id, counts in state["counts"].items()
-            },
+            "turns": {turn_id: dict(counts) for turn_id, counts in state["counts"].items()},
             "activeTurnId": state["currentTurn"],
             "activeStartedAt": state["currentStartedAt"],
             "status": state["lastStatus"],
@@ -1541,6 +1717,62 @@ def _safe_item(item: Any) -> Optional[dict[str, Any]]:
     return None
 
 
+def _bounded_turn_items(
+    items: Any, started_at: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Keep conversation semantics and the mutable tail within a bounded budget.
+
+    The source revision includes sanitized omitted entries, so an update beyond
+    the display budget cannot be mistaken for an unchanged incremental tail.
+    """
+    if not isinstance(items, list):
+        return [], {}
+    messages: deque[tuple[int, dict[str, Any]]] = deque(maxlen=HISTORY_MAX_ITEMS)
+    activities: deque[tuple[int, dict[str, Any]]] = deque(maxlen=HISTORY_MAX_ITEMS)
+    first_user = None
+    last_final = None
+    digest = hashlib.sha256()
+    supported_count = 0
+    for index, item in enumerate(items):
+        safe = _safe_item(item)
+        if safe is None:
+            continue
+        if safe["type"] == "userMessage" and started_at is not None:
+            safe["timestamp"] = started_at
+        digest.update(json.dumps([index, safe], ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":")).encode("utf-8"))
+        supported_count += 1
+        entry = (index, safe)
+        if safe["type"] in {"userMessage", "agentMessage"}:
+            messages.append(entry)
+            if safe["type"] == "userMessage" and first_user is None:
+                first_user = entry
+            if safe.get("phase") == "final_answer":
+                last_final = entry
+        else:
+            activities.append(entry)
+    selected = dict(messages)
+    protected = {entry[0] for entry in (first_user, last_final) if entry is not None}
+    for entry in (first_user, last_final):
+        if entry is None or entry[0] in selected:
+            continue
+        if len(selected) >= HISTORY_MAX_ITEMS:
+            evict = next(index for index in selected if index not in protected)
+            selected.pop(evict)
+        selected[entry[0]] = entry[1]
+    remaining = HISTORY_MAX_ITEMS - len(selected)
+    if remaining:
+        selected.update(list(activities)[-remaining:])
+    omitted = supported_count - len(selected)
+    truncation = {
+        "itemsTruncated": True,
+        "omittedItemCount": omitted,
+        "sourceItemCount": len(items),
+        "sourceRevision": digest.hexdigest(),
+    } if omitted else {}
+    return [selected[index] for index in sorted(selected)], truncation
+
+
 def summarize_thread_detail(
     thread: dict[str, Any],
     project_index: Optional[dict[str, Any]] = None,
@@ -1561,17 +1793,7 @@ def summarize_thread_detail(
             turn_id = str(turn.get("id", ""))
             turn_is_active = turn_id == str(rollout_snapshot["activeTurnId"] or "")
             items = turn.get("items")
-            safe_items = []
-            if isinstance(items, list):
-                for item in items[:200]:
-                    safe_item = _safe_item(item)
-                    if safe_item is not None:
-                        if (
-                            safe_item.get("type") == "userMessage"
-                            and turn.get("startedAt") is not None
-                        ):
-                            safe_item["timestamp"] = turn.get("startedAt")
-                        safe_items.append(safe_item)
+            safe_items, truncation = _bounded_turn_items(items, turn.get("startedAt"))
             activity_items = [
                 {
                     "id": f"rollout-{turn.get('id', '')}-{kind}",
@@ -1613,8 +1835,12 @@ def summarize_thread_detail(
             if not turn_is_active and str(turn.get("status", "")) == "completed":
                 for safe_item in reversed(safe_items):
                     if safe_item.get("type") == "agentMessage":
-                        safe_item["phase"] = "final_answer"
-                        if turn.get("completedAt") is not None:
+                        # Legacy records omit phase; keep that compatibility,
+                        # but explicit commentary is never a final answer.
+                        if safe_item.get("phase") in {None, ""}:
+                            safe_item["phase"] = "final_answer"
+                        if (safe_item.get("phase") == "final_answer"
+                                and turn.get("completedAt") is not None):
                             safe_item["timestamp"] = turn.get("completedAt")
                         break
             safe_turns.append(
@@ -1629,6 +1855,7 @@ def summarize_thread_detail(
                         else None
                     ),
                     "items": safe_items,
+                    **truncation,
                 }
             )
     active_turn_id = str(rollout_snapshot["activeTurnId"] or "")

@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from bridge_runtime import BridgeRuntime
+from delivery_journal import DeliveryJournal, delivery_identity, user_receipt_ids
 
 from codex_app_server import (
     AppServerError,
@@ -51,6 +53,7 @@ MAX_DEVICES = 32
 PAIRING_TICKET_TTL_SECONDS = 300
 THREAD_DETAIL_CACHE_TTL_SECONDS = 60
 THREAD_DETAIL_CACHE_MAX_ENTRIES = 24
+DESKTOP_STATUS_CACHE_TTL_SECONDS = 0.75
 LOCAL_HOTSPOT_STATE_DIR = (
     Path.home() / "Library" / "Application Support" / "MobileCodexBridge"
 )
@@ -1351,9 +1354,10 @@ class BridgeServer(ThreadingHTTPServer):
         screen_lock_probe: Optional[Callable[[], Optional[bool]]] = None,
         runtime: Optional[BridgeRuntime] = None,
         battery_probe: Optional[Callable[[], dict[str, Any]]] = None,
+        delivery_journal: Optional[DeliveryJournal] = None,
     ) -> None:
         self.token = token
-        self.runtime = runtime or BridgeRuntime()
+        self.runtime = runtime or BridgeRuntime(delivery_receipts=True)
         self.battery_probe = battery_probe or (lambda: read_mac_battery())
         self.controller = controller
         self.web_root = web_root or Path(__file__).resolve().parent / "web"
@@ -1376,6 +1380,20 @@ class BridgeServer(ThreadingHTTPServer):
             or Path.home() / "Documents" / "Codex"
         )
         self.screen_lock_probe = screen_lock_probe or read_screen_lock_state
+        self.delivery_journal = delivery_journal
+        if self.runtime.delivery_receipts and self.delivery_journal is None:
+            journal_root = (
+                self.device_registry.path.parent if self.device_registry.path is not None
+                else self.codex_state_path.parent if codex_state_path is not None
+                else LOCAL_HOTSPOT_STATE_DIR
+            )
+            self.delivery_journal = DeliveryJournal(journal_root / "delivery.sqlite")
+        self._desktop_status_condition = threading.Condition()
+        self._desktop_status_inflight = False
+        self._desktop_status_cached_at = 0.0
+        self._desktop_status_generation = 0
+        self._desktop_status_value: Optional[dict[str, Any]] = None
+        self._desktop_status_error: Optional[Exception] = None
         self._project_index_lock = threading.RLock()
         self._project_index = load_codex_project_index(self.codex_state_path)
         self._project_index_shrink_seen_at: Optional[float] = None
@@ -1384,6 +1402,55 @@ class BridgeServer(ThreadingHTTPServer):
         ] = OrderedDict()
         self._thread_detail_cache_lock = threading.RLock()
         super().__init__(address, BridgeHandler)
+
+    def readiness(self) -> dict[str, Any]:
+        """Read transport health without launching or activating Desktop."""
+        transport = getattr(self.app_server, "transport_status", None)
+        app_status = (transport() if callable(transport) else {
+            "ready": self.app_server is not None,
+            "state": "ready" if self.app_server is not None else "unavailable",
+            "retryAfterSeconds": 0,
+        })
+        return {"ok": app_status.get("ready") is True, "appServer": app_status,
+                "capabilities": self.runtime.capabilities()}
+
+    def invalidate_desktop_status(self) -> None:
+        with self._desktop_status_condition:
+            self._desktop_status_cached_at = 0.0
+            self._desktop_status_generation += 1
+
+    def desktop_status(self) -> dict[str, Any]:
+        """Share display probes across clients; action guards remain uncached."""
+        with self._desktop_status_condition:
+            while self._desktop_status_inflight:
+                if not self._desktop_status_condition.wait_for(
+                    lambda: not self._desktop_status_inflight, timeout=26,
+                ):
+                    raise TimeoutError("Desktop status probe is still running")
+            if time.monotonic() - self._desktop_status_cached_at < DESKTOP_STATUS_CACHE_TTL_SECONDS:
+                if self._desktop_status_error is not None:
+                    raise self._desktop_status_error
+                if self._desktop_status_value is not None:
+                    return self._desktop_status_value
+            self._desktop_status_inflight = True
+            generation = self._desktop_status_generation
+        value = None
+        error = None
+        try:
+            value = self.controller.status()
+            return value
+        except Exception as caught:
+            error = caught
+            raise
+        finally:
+            with self._desktop_status_condition:
+                self._desktop_status_value = value
+                self._desktop_status_error = error
+                self._desktop_status_cached_at = (
+                    time.monotonic() if generation == self._desktop_status_generation else 0.0
+                )
+                self._desktop_status_inflight = False
+                self._desktop_status_condition.notify_all()
 
     def screen_lock_state(self) -> Optional[bool]:
         try:
@@ -1626,6 +1693,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return False
 
     def _read_json(self) -> Optional[dict[str, Any]]:
+        if getattr(self, "_delivery_body", None) is not None:
+            return self._delivery_body
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -1705,7 +1774,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "application/manifest+json; charset=utf-8",
             )
             return
-        if path == "/health":
+        if path == "/health/ready":
+            readiness = self.server.readiness()
+            self._send_json(HTTPStatus.OK if readiness["ok"] else HTTPStatus.SERVICE_UNAVAILABLE,
+                            readiness)
+            return
+        if path in {"/health", "/health/live"}:
             self._send_json(HTTPStatus.OK, {
                 "ok": True,
                 "service": "mac-codex-bridge" if self.server.runtime.platform == "macos"
@@ -1971,15 +2045,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 })
                 return
             try:
-                status = self.server.controller.status()
-            except (RuntimeError, TaskIdentityError) as error:
+                status = self.server.desktop_status()
+            except (RuntimeError, TaskIdentityError, subprocess.TimeoutExpired, TimeoutError, OSError) as error:
                 print(
                     f"Accessibility status probe failed: {type(error).__name__}: {error}",
                     file=sys.stderr,
                     flush=True,
                 )
                 reason = "probe_failed"
-                if isinstance(error, TaskIdentityError):
+                if isinstance(error, (subprocess.TimeoutExpired, TimeoutError)):
+                    reason = "probe_timeout"
+                elif isinstance(error, TaskIdentityError):
                     reason = "task_title_missing" if error.count == 0 else "task_title_ambiguous"
                 elif "Accessibility permission is not granted" in str(error):
                     reason = "accessibility_permission_required"
@@ -2003,7 +2079,212 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
+    def _advance_delivery(self, phase: str, *, thread_id: Optional[str] = None,
+                          baseline: Optional[set[str]] = None) -> None:
+        context = getattr(self, "_delivery_context", None)
+        if context is not None:
+            self.server.delivery_journal.advance(
+                context["owner"], context["requestId"], phase,
+                thread_id=thread_id, baseline=baseline,
+            )
+
+    @staticmethod
+    def _safe_delivery_result(payload: dict[str, Any]) -> dict[str, Any]:
+        """Do not add another persisted copy of prompts/titles/history."""
+        safe = {key: payload[key] for key in
+                ("ok", "error", "reason", "mode", "retryAllowed", "threadCreated", "threadId")
+                if key in payload}
+        thread = payload.get("thread")
+        if isinstance(thread, dict) and isinstance(thread.get("id"), str):
+            safe["threadId"] = thread["id"]
+        desktop = payload.get("desktop")
+        if isinstance(desktop, dict):
+            safe["desktop"] = {key: desktop[key] for key in ("ok", "mode", "confirmedBy")
+                               if key in desktop}
+        run = payload.get("run")
+        if isinstance(run, dict):
+            safe["run"] = {key: run[key] for key in ("threadId", "turnId", "status") if key in run}
+        return safe
+
+    def _delivery_reply(self, record: Optional[dict[str, Any]], payload: dict[str, Any],
+                        *, replayed: bool, response: Optional[dict[str, Any]] = None,
+                        status: Optional[int] = None) -> None:
+        if response is None:
+            if record is not None and record["state"] in {"confirmed", "refused"}:
+                response = dict(record["result"] or {})
+                status = record["status"]
+            else:
+                response = {"ok": False, "error": "delivery_receipt_pending", "retryAllowed": False}
+                status = HTTPStatus.CONFLICT
+        response = dict(response)
+        if record is not None and record["scope"] == "create" and record["thread_id"]:
+            thread_id = record["thread_id"]
+            response.update(threadCreated=True, threadId=thread_id)
+            if not isinstance(response.get("thread"), dict):
+                # A durable success must remain replayable even while the
+                # read transport is unavailable. Hydrate when possible.
+                thread = {"id": thread_id, "title": "已创建的任务"}
+                if self.server.app_server is not None:
+                    try:
+                        thread = summarize_thread(read_thread_tail(self.server.app_server, thread_id),
+                                                  self.server.project_index())
+                    except AppServerError:
+                        pass
+                response["thread"] = thread
+        response["delivery"] = {
+            "requestId": payload["requestId"], "replayed": replayed,
+            "receiptOnly": payload.get("receiptOnly", False),
+        }
+        self._send_json(status or HTTPStatus.CONFLICT, response)
+
+    def _reconcile_delivery(self, owner: str, record: dict[str, Any],
+                            payload: dict[str, Any]) -> dict[str, Any]:
+        if (record["state"] not in {"claimed", "uncertain"}
+                or record["phase"] not in {"dispatching", "background_dispatching"}
+                or not record["thread_id"] or record["baseline"] is None
+                or payload.get("attachmentIds") or self.server.app_server is None):
+            return record
+        thread_id = record["thread_id"]
+        try:
+            thread = read_thread_tail(self.server.app_server, thread_id)
+        except AppServerError:
+            return record
+        fresh = user_receipt_ids(thread, thread_id, payload["message"].strip()) - record["baseline"]
+        if len(fresh) != 1:
+            return record
+        mode = "background" if record["phase"] == "background_dispatching" else "desktop"
+        result: dict[str, Any] = {"ok": True, "mode": mode, "threadId": thread_id}
+        if mode == "desktop":
+            result["desktop"] = {"ok": True, "confirmedBy": "threadHistory"}
+        else:
+            # This is an acknowledgement of an existing turn, not a claim
+            # that its old inProgress snapshot is still current.
+            result["run"] = {"threadId": thread_id}
+        return self.server.delivery_journal.finish(
+            owner, payload["requestId"], "confirmed", HTTPStatus.ACCEPTED, result,
+        )
+
+    def _handle_receipted_post(self) -> bool:
+        if not self.server.runtime.delivery_receipts or self.server.delivery_journal is None:
+            return False
+        path = urllib.parse.urlsplit(self.path).path
+        match = re.fullmatch(r"/api/codex/threads/([^/]+)/turn", path)
+        if path != "/api/codex/threads" and match is None:
+            return False
+        if not self._require_control_auth():
+            return True
+        payload = self._read_json()
+        if payload is None:
+            return True
+        self._delivery_body = payload
+        if "requestId" not in payload and "receiptOnly" not in payload:
+            return False  # Older paired clients retain their original behavior.
+        scope = "create" if match is None else urllib.parse.unquote(match.group(1))
+        if not scope or "/" in scope or len(scope) > 128:
+            self._send_json(HTTPStatus.BAD_REQUEST,
+                            {"ok": False, "error": "invalid_thread_id", "retryAllowed": True})
+            return True
+        device = self._device_identity()
+        owner = device["id"] if device is not None else "legacy-master"
+        try:
+            delivery_identity(scope, payload)
+            record = self.server.delivery_journal.claim(
+                owner, scope, payload, receipt_only=payload.get("receiptOnly", False),
+            )
+        except ValueError as error:
+            reason = str(error)
+            # Validation runs before the durable claim and has no side effect.
+            # A conflicting existing claim must retain its reconciliation ID.
+            retry_allowed = reason not in {
+                "delivery_confirmation_pending", "delivery_id_reused_with_different_content",
+            }
+            self._send_json(HTTPStatus.CONFLICT if reason == "delivery_confirmation_pending"
+                            else HTTPStatus.BAD_REQUEST,
+                            {"ok": False, "error": reason, "retryAllowed": retry_allowed})
+            return True
+        except (OSError, sqlite3.Error):
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE,
+                            {"ok": False, "error": "delivery_journal_unavailable", "retryAllowed": False})
+            return True
+        if record is None or not record["dispatch"]:
+            try:
+                if record is not None:
+                    record = self._reconcile_delivery(owner, record, payload)
+                self._delivery_reply(record, payload, replayed=True)
+            except (OSError, sqlite3.Error):
+                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE,
+                                {"ok": False, "error": "delivery_journal_unavailable", "retryAllowed": False})
+            return True
+
+        self._delivery_context = {"owner": owner, "requestId": payload["requestId"]}
+        send_json = self._send_json
+        captured: list[tuple[int, dict[str, Any]]] = []
+        self._send_json = lambda status, response: captured.append((int(status), response))
+        try:
+            self._dispatch_post()
+        except Exception as error:
+            # A failed HTTP request cannot cancel a submitted Desktop action.
+            # Keep a durable uncertain claim instead of making a retry writable.
+            print("Delivery failed: " + type(error).__name__, file=sys.stderr, flush=True)
+            captured = [(HTTPStatus.BAD_GATEWAY, {"ok": False, "error": "delivery_uncertain"})]
+        finally:
+            self._send_json = send_json
+        status, response = captured[-1] if captured else (
+            HTTPStatus.BAD_GATEWAY, {"ok": False, "error": "delivery_uncertain"},
+        )
+        try:
+            record = self.server.delivery_journal.get(owner, payload["requestId"])
+            success = 200 <= status < 300 and response.get("ok") is True
+            # create_thread performs allocation, naming and settings internally.
+            # Even a later validation error may follow allocation: until its ID
+            # is durably bound, any creation-stage error remains uncertain.
+            known_refusal = (record["phase"] in {"preflight", "created"}
+                             or (record["phase"] != "creating" and (
+                                 status in {400, 401, 403, 404, 409}
+                                 or response.get("error") in {
+                                 "desktop_accessibility_unavailable", "desktop_composer_unavailable",
+                                 "desktop_composer_write_failed", "desktop_composer_focus_failed",
+                                 "desktop_send_unavailable", "desktop_attachment_invalid",
+                                 "desktop_attachment_paste_failed", "desktop_attachment_unconfirmed",
+                                 "desktop_attachment_conflict", "desktop_matching_draft_replace_failed",
+                                 "desktop_keyboard_input_failed", "desktop_keyboard_input_unconfirmed",
+                             })))
+            state = "confirmed" if success else "refused" if known_refusal else "uncertain"
+            if not success:
+                response = dict(response, retryAllowed=state == "refused")
+                if state == "uncertain":
+                    response = {"ok": False, "error": "delivery_uncertain", "retryAllowed": False,
+                                "reason": str(response.get("error", "dispatch_failed"))[:100]}
+                    status = HTTPStatus.CONFLICT
+            finished = self.server.delivery_journal.finish(
+                owner, payload["requestId"], state, status, self._safe_delivery_result(response),
+            )
+            if finished["state"] != state:
+                self._delivery_reply(finished, payload, replayed=True)
+            else:
+                self._delivery_reply(finished, payload, replayed=False, response=response, status=status)
+        except (OSError, sqlite3.Error):
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE,
+                            {"ok": False, "error": "delivery_uncertain", "retryAllowed": False,
+                             "delivery": {"requestId": payload["requestId"], "replayed": False,
+                                          "receiptOnly": False}})
+        return True
+
     def do_POST(self) -> None:
+        self._delivery_body = None
+        self._delivery_context = None
+        try:
+            if not self._handle_receipted_post():
+                self._dispatch_post()
+        finally:
+            self._delivery_body = None
+            self._delivery_context = None
+            # Display snapshots may be stale after any control mutation. This
+            # does not alter DesktopController's fresh pre-action checks.
+            if self.path.startswith(("/api/codex/threads", "/api/desktop/")):
+                self.server.invalidate_desktop_status()
+
+    def _dispatch_post(self) -> None:
         if urllib.parse.urlsplit(self.path).path == "/api/attachments":
             device = self._device_identity()
             if device is None:
@@ -2245,6 +2526,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     )
                     return
             try:
+                self._advance_delivery("creating")
                 created = self.server.app_server.create_thread(
                     title=title,
                     cwd=cwd,
@@ -2256,6 +2538,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
                     raise AppServerError("Invalid created thread.")
                 thread_id = thread["id"]
+                self._advance_delivery("created", thread_id=thread_id)
             except ManagedRequestError:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
@@ -2298,6 +2581,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             if background_dispatch:
                 try:
+                    self._advance_delivery("background_dispatching", thread_id=thread_id,
+                                           baseline=user_receipt_ids(thread, thread_id))
                     run = self.server.app_server.start_turn(
                         thread_id,
                         message.strip(),
@@ -2340,6 +2625,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             previous_user_messages = thread_user_message_fingerprints(thread)
             try:
+                self._advance_delivery("dispatching", thread_id=thread_id,
+                                       baseline=user_receipt_ids(thread, thread_id))
                 desktop = self.server.controller.send_to_desktop(
                     thread_id,
                     title,
@@ -2581,6 +2868,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         )
                         return
                     try:
+                        self._advance_delivery("background_dispatching", thread_id=thread_id,
+                                               baseline=user_receipt_ids(thread, thread_id))
                         run = (
                             self.server.app_server.continue_turn(thread_id)
                             if is_continue
@@ -2609,6 +2898,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     return
                 previous_user_messages = thread_user_message_fingerprints(thread)
                 try:
+                    self._advance_delivery("dispatching", thread_id=thread_id,
+                                           baseline=user_receipt_ids(thread, thread_id))
                     desktop = self.server.controller.send_to_desktop(
                         thread_id,
                         summary["title"],
@@ -3013,7 +3304,10 @@ def main() -> int:
             app_server = candidate
             print(f"managed Codex app-server connected over private stdio: {codex_binary}", flush=True)
         except AppServerError:
-            print("managed Codex app-server is unavailable; task browsing is disabled")
+            # Keep the read client: safe read operations can reconnect after a
+            # transient startup failure instead of permanently returning 503.
+            app_server = candidate
+            print("managed Codex app-server is unavailable; read requests will retry initialization")
     server = BridgeServer(
         (args.host, args.port),
         token,
