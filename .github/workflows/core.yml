@@ -1,0 +1,36 @@
+name: Core reliability checks
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main, 'perf/**']
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Python regression tests (isolated fixtures and loopback only)
+        run: python -m unittest discover -s tests -v
+      - name: Browser regression tests
+        run: node --test tests/test_web_*.cjs
+      - name: Browser syntax
+        run: |
+          node --check web/app.js
+          node --check web/pairing/pair.js
