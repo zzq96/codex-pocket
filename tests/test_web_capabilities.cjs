@@ -17,12 +17,14 @@ test('status failure distinguishes permission and identity without trusting raw 
   const messages = [];
   const context = vm.createContext({
     hostLabel: () => 'Mac', deviceToken: 'test-token',
+    AbortController, window: {setTimeout, clearTimeout},
     authorizationHeaders: () => ({}),
     renderManagedRun() {}, renderProjectGroups() {}, updateComposerState() {},
     setDeviceState: (_, text) => messages.push(text),
     currentStopCandidates: 1, desktopStatusKnown: true, desktopRequest: {},
     managedRenderSignature: 'old',
   });
+  vm.runInContext(between('async function fetchJSONWithTimeout(', 'async function measureBridgeLatency('), context);
   vm.runInContext(between('function desktopStatusFailureText(', 'async function refreshStatus()'), context);
   for (const [reason, expected] of [
     ['accessibility_permission_required', '助手需要辅助功能授权'],

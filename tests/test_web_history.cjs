@@ -9,7 +9,10 @@ const turn = (id, text = id) => ({id, items: [{text}]});
 const snapshot = (ids, next = 'older') => ({id: 't', historyPaged: true, historyNextCursor: next,
   historyTruncated: !!next, turns: ids.map(id => turn(id))});
 function harness(extra = {}) {
-  const context = vm.createContext({Set, Map, URLSearchParams, ...extra});
+  const context = vm.createContext({Set, Map, URLSearchParams, AbortController,
+    window: {setTimeout, clearTimeout}, ...extra});
+  vm.runInContext(source.slice(source.indexOf('async function fetchJSONWithTimeout('),
+    source.indexOf('async function measureBridgeLatency(')), context);
   vm.runInContext(code, context);
   return context;
 }

@@ -1852,6 +1852,7 @@ class BridgeApiTest(unittest.TestCase):
         ]
         for error, reason in cases:
             with self.subTest(reason=reason), patch.object(self.controller, "status", side_effect=error):
+                self.server.invalidate_desktop_status()
                 status, payload = self.request("GET", "/api/desktop/interrupt/status")
                 self.assertEqual(status, 502)
                 self.assertEqual(payload, {"ok": False, "error": "accessibility_probe_failed", "reason": reason})
