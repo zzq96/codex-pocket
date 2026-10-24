@@ -12,6 +12,7 @@ class BridgeRuntime:
     native_text_send: bool = False
     native_new_tasks: bool = False
     attachment_paths: bool = False
+    delivery_receipts: bool = False
 
     def __post_init__(self) -> None:
         if self.native_new_tasks and not self.native_text_send:
@@ -36,6 +37,8 @@ class BridgeRuntime:
             result.update(nativeTextSend=True, newTasks=self.native_new_tasks, nativeReceiptPolling=True)
         if self.attachment_paths:
             result['attachmentMode'] = 'localPaths'
+        if self.delivery_receipts:
+            result['deliveryReceipts'] = True
         return result
 
 

@@ -12,6 +12,7 @@ function applyBridgeCapabilities(value) {
     attachmentMode: value.attachmentMode === 'localPaths' ? 'localPaths' : 'native',
     nativeTextSend: value.nativeTextSend === true,
     nativeReceiptPolling: value.nativeTextSend === true && value.nativeReceiptPolling === true,
+    deliveryReceipts: value.deliveryReceipts === true,
     nativeStop: value.nativeStop === true,
     nativeResume: value.nativeResume === true,
     newTasks: value.nativeTextSend === true ? value.newTasks === true : value.newTasks !== false,
@@ -205,6 +206,8 @@ let drawerStatusPollTimer;
 let threadCatalogRetryTimer;
 let desktopHistoryRefreshInFlight = false;
 let statusRefreshPromise;
+const managedRunRefreshes = new Map();
+const managedRunRequestVersions = new Map();
 let drawerStatusRefreshPromise;
 let usageRefreshPromise;
 let usageLastRefreshedAt = 0;
@@ -238,6 +241,7 @@ const persistedManagedTurnIds = new Set();
 const threadDrafts = new Map();
 const threadAttachments = new Map();
 const threadHistoryCache = new Map();
+let persistedThreadSessionPayload = "";
 const historyRequestVersions = new Map();
 const olderHistoryLoading = new Set();
 const renderedThreadSignatures = new Map();
@@ -325,24 +329,39 @@ function renderConnectionLatency(milliseconds) {
   elements.connectionLatency.textContent = `延迟 ${rounded} ms`;
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 5_000) {
+async function fetchJSONWithTimeout(url, options = {}, timeoutMs = 15_000) {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  const onAbort = () => controller.abort(options.signal.reason);
+  if (options.signal?.aborted) onAbort();
+  else options.signal?.addEventListener("abort", onAbort, { once: true });
+  let timeout;
+  const deadline = new Promise((_, reject) => {
+    timeout = window.setTimeout(() => {
+      controller.abort();
+      reject(new Error("read_timeout"));
+    }, timeoutMs);
+  });
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    // Keep the deadline alive until the body is read, not just its headers.
+    return await Promise.race([(async () => {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      const result = response.status === 401 ? undefined : await response.json();
+      return { response, result };
+    })(), deadline]);
   } finally {
     window.clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", onAbort);
   }
 }
 
 async function measureBridgeLatency() {
   const startedAt = performance.now();
-  const response = await fetchWithTimeout(
+  const { response } = await fetchJSONWithTimeout(
     `/health?probe=${Date.now()}`,
     { cache: "no-store" },
+    5_000,
   );
   if (!response.ok) throw new Error("health probe failed");
-  await response.json();
   return performance.now() - startedAt;
 }
 
@@ -352,10 +371,10 @@ async function refreshSystemMetrics(force = false) {
   systemMetricsRefreshPromise = (async () => {
     const [latencyResult, metricsResult] = await Promise.allSettled([
       measureBridgeLatency(),
-      fetchWithTimeout("/api/system/metrics", {
+      fetchJSONWithTimeout("/api/system/metrics", {
         headers: authorizationHeaders(),
         cache: "no-store",
-      }),
+      }, 5_000),
     ]);
     if (latencyResult.status === "fulfilled") {
       bridgeLatencySamples.push(latencyResult.value);
@@ -366,14 +385,13 @@ async function refreshSystemMetrics(force = false) {
       renderConnectionLatency(Number.NaN);
     }
     if (metricsResult.status === "fulfilled") {
-      const response = metricsResult.value;
+      const { response, result } = metricsResult.value;
       if (response.status === 401) {
         handleUnauthorized();
         return;
       }
       if (response.ok) {
         try {
-          const result = await response.json();
           renderMacBattery(result.battery);
           renderLocalConnectionState(result.localHotspot);
         } catch {
@@ -833,12 +851,11 @@ async function refreshDrawerThreadStates() {
   if (!deviceToken || drawerStatusRefreshPromise) return drawerStatusRefreshPromise;
   drawerStatusRefreshPromise = (async () => {
     try {
-      const response = await fetch("/api/codex/threads?limit=50", {
+      const { response, result } = await fetchJSONWithTimeout("/api/codex/threads?limit=50", {
         headers: authorizationHeaders(),
         cache: "no-store",
       });
       if (!response.ok) return;
-      const result = await response.json();
       if (!reconcileThreadCatalog(result)) return;
       if (elements.projectDrawer.classList.contains("open")) renderProjectGroups();
     } catch {
@@ -919,7 +936,7 @@ async function refreshUsage(force = false) {
     elements.refreshUsageButton.disabled = true;
     elements.refreshUsageButton.classList.add("refreshing");
     try {
-      const response = await fetch("/api/codex/usage", {
+      const { response, result } = await fetchJSONWithTimeout("/api/codex/usage", {
         headers: authorizationHeaders(),
         cache: "no-store",
       });
@@ -928,7 +945,6 @@ async function refreshUsage(force = false) {
         return;
       }
       if (!response.ok) throw new Error("usage read failed");
-      const result = await response.json();
       renderUsage(result.usage);
       usageLastRefreshedAt = Date.now();
     } catch {
@@ -1002,7 +1018,7 @@ async function refreshModelSettings(threadId, force = false) {
     updateComposerState();
   }
   try {
-    const response = await fetch(
+    const { response, result } = await fetchJSONWithTimeout(
       `/api/codex/models?threadId=${encodeURIComponent(threadId)}`,
       { headers: authorizationHeaders(), cache: "no-store" },
     );
@@ -1011,7 +1027,6 @@ async function refreshModelSettings(threadId, force = false) {
       return undefined;
     }
     if (!response.ok) throw new Error("model settings read failed");
-    const result = await response.json();
     const entry = {
       models: result.models || [],
       settings: result.settings || {},
@@ -1523,10 +1538,17 @@ function followLatestOrNotify(wasNearBottom) {
 function threadContentSignature(thread) {
   return JSON.stringify({
     activityStatus: thread.activityStatus,
+    turnCount: thread.turns?.length || 0,
+    firstTurnId: thread.turns?.[0]?.id,
+    historyNextCursor: thread.historyNextCursor,
     turns: (thread.turns || []).slice(-3).map((turn) => ({
       id: turn.id,
       status: turn.status,
       completedAt: turn.completedAt,
+      sourceRevision: turn.sourceRevision,
+      itemsTruncated: turn.itemsTruncated,
+      omittedItemCount: turn.omittedItemCount,
+      sourceItemCount: turn.sourceItemCount,
       items: (turn.items || []).map((item) => ({
         id: item.id,
         type: item.type,
@@ -2124,6 +2146,8 @@ function openNewTaskDialog(target) {
 async function createNewTask() {
   if (!newTaskTarget || isCreatingTask || bridgeCapabilities.newTasks === false) return;
   const message = elements.newTaskMessage.value.trim();
+  const usesDeliveryReceipts = bridgeCapabilities.nativeTextSend || bridgeCapabilities.deliveryReceipts;
+  const usesMacReceipts = bridgeCapabilities.deliveryReceipts && !bridgeCapabilities.nativeTextSend;
   if (!message && !newTaskAttachments.length) {
     elements.newTaskError.textContent = "请输入第一条指令或添加附件。";
     return;
@@ -2145,12 +2169,19 @@ async function createNewTask() {
   elements.newTaskError.textContent = "正在电脑上创建并发送…";
   renderProjectGroups();
   const requestController = new AbortController();
-  const requestTimeout = bridgeCapabilities.nativeTextSend ? undefined : window.setTimeout(
+  const requestTimeout = usesDeliveryReceipts ? undefined : window.setTimeout(
     () => requestController.abort(),
     newTaskAttachments.length ? 45_000 : 20_000,
   );
   try {
-    if (bridgeCapabilities.nativeTextSend) {
+    if (usesMacReceipts) {
+      const prepared = await prepareMacDelivery("create", body);
+      if (prepared.blocked) {
+        elements.newTaskError.textContent = prepared.feedback + macDeliveryDiagnostic("create");
+        return;
+      }
+      body.requestId = prepared.requestId;
+    } else if (usesDeliveryReceipts) {
       body.requestId = await nativeDeliveryRequestId("create", JSON.stringify(body));
     }
     const options = {
@@ -2163,7 +2194,7 @@ async function createNewTask() {
       signal: requestController.signal,
     };
     let response, nativeResult;
-    if (bridgeCapabilities.nativeTextSend) {
+    if (usesDeliveryReceipts) {
       ({ response, result: nativeResult } = await nativeDeliveryResponse("/api/codex/threads", options, 45_000,
         () => { elements.newTaskError.textContent = "等待 Desktop 回执…正在自动核对，不会重复创建或发送"; }));
     } else {
@@ -2173,17 +2204,22 @@ async function createNewTask() {
       handleUnauthorized();
       return;
     }
-    const result = bridgeCapabilities.nativeTextSend ? nativeResult : await response.json();
+    const result = usesDeliveryReceipts ? nativeResult : await response.json();
     if (!response.ok) {
-      if (bridgeCapabilities.nativeTextSend && result.retryAllowed === true) {
+      if (usesDeliveryReceipts && result.retryAllowed === true) {
         sessionStorage.removeItem("pocket-native-delivery:create");
+        if (usesMacReceipts) forgetMacDelivery("create");
       }
       if (result.threadCreated && result.threadId) {
-        if (bridgeCapabilities.nativeTextSend) {
-          if (result.retryAllowed === false && result.error === "native_delivery_uncertain") {
+        if (usesDeliveryReceipts) {
+          if (result.retryAllowed === false && ["native_delivery_uncertain", "delivery_uncertain", "delivery_receipt_pending"].includes(result.error)) {
             await nativeDeliveryRequestId(result.threadId, nativeMessageIdentity(message, newTaskAttachments), body.requestId);
+            if (usesMacReceipts) rememberMacDelivery(result.threadId, {
+              message, attachmentIds: newTaskAttachments.map(attachment => attachment.id), requestId: body.requestId,
+            });
           }
           sessionStorage.removeItem("pocket-native-delivery:create");
+          if (usesMacReceipts) forgetMacDelivery("create");
         }
         if (message) threadDrafts.set(result.threadId, message);
         if (newTaskAttachments.length) {
@@ -2210,6 +2246,9 @@ async function createNewTask() {
         const dispatchMessages = {
           desktop_send_unconfirmed: "任务已创建，发送结果暂未确认；草稿已保留，请先检查对话是否收到，避免重复发送。",
           native_delivery_uncertain: "任务已创建，发送结果待确认；草稿已保留，同一条消息重试只核对回执，不会重复点击发送。",
+          delivery_uncertain: "任务已创建，发送结果待确认；草稿已保留，同一条消息重试只核对回执，不会重复发送。",
+          delivery_receipt_pending: "任务已创建，正在核对发送结果；草稿与请求编号已保留，请勿更改内容重复发送。",
+          delivery_manually_refused: "上次请求已由电脑端解除待确认；任务与草稿已保留，重新发送需再次点击。",
           project_assignment_failed: "空任务已创建，但 Project/Recents 归属未确认，没有发送。请先在电脑核对归属。",
           desktop_accessibility_unavailable: "空任务已创建，但后台 Helper 的辅助功能授权已失效；请在 Mac 上重新开关授权后重试。",
           desktop_attachment_unconfirmed: "空任务已创建，但 Desktop 没有确认附件；指令和附件已保留，可重试。",
@@ -2218,10 +2257,14 @@ async function createNewTask() {
         };
         elements.composerState.textContent = dispatchMessages[result.error]
           || "任务已创建，但 Desktop 没有确认发送；指令已保留，可重试。";
+        if (usesMacReceipts) elements.composerState.textContent += macDeliveryDiagnostic(result.threadId);
         return;
       }
       const messages = {
         native_create_uncertain: "创建结果待确认，已保留本次请求；请先核对电脑任务列表，不要更改内容重复创建。",
+        delivery_uncertain: "创建或发送结果待确认，草稿与请求编号已保留；同样内容重试只核对回执。",
+        delivery_receipt_pending: "之前的创建结果仍待确认，草稿与请求编号已保留，没有重复创建。",
+        delivery_manually_refused: "上次请求已由电脑端解除待确认；当前草稿已保留，重新提交需再次点击。",
         delivery_confirmation_pending: "之前的创建结果仍未确认，未再次创建；请先核对电脑任务列表。",
         native_helper_unavailable: "Windows 桌面助手未就绪，没有创建任务。",
         native_create_refused: "上次创建未通过检查；请检查桌面助手和项目目录后重试。",
@@ -2234,6 +2277,7 @@ async function createNewTask() {
         thread_create_failed: "Desktop 没有成功创建任务，请稍后重试。",
       };
       elements.newTaskError.textContent = messages[result.error] || "新任务没有创建，请稍后重试。";
+      if (usesMacReceipts) elements.newTaskError.textContent += macDeliveryDiagnostic("create");
       if (result.error === "desktop_turn_active") {
         await refreshStatus();
       }
@@ -2245,7 +2289,12 @@ async function createNewTask() {
         && result.desktop?.ok && result.desktop?.confirmedBy === "threadHistory")) {
       throw new Error("native creation delivery receipt missing");
     }
-    if (bridgeCapabilities.nativeTextSend) sessionStorage.removeItem("pocket-native-delivery:create");
+    if (bridgeCapabilities.deliveryReceipts && !bridgeCapabilities.nativeTextSend
+        && (result.ok !== true || result.delivery?.requestId !== body.requestId)) {
+      throw new Error("creation delivery receipt missing");
+    }
+    if (usesDeliveryReceipts) sessionStorage.removeItem("pocket-native-delivery:create");
+    if (usesMacReceipts) forgetMacDelivery("create");
     threads = [createdThread, ...threads.filter((thread) => thread.id !== createdThread.id)];
     if (sourceEntry?.models && result.settings) {
       modelSettingsCache.set(createdThread.id, {
@@ -2254,7 +2303,9 @@ async function createNewTask() {
         fetchedAt: Date.now(),
       });
     }
-    if (!result.desktop?.duplicateRequest && !result.desktop?.receiptPolled) {
+    const replayed = result.desktop?.duplicateRequest || result.desktop?.receiptPolled
+      || result.delivery?.replayed || result.delivery?.receiptOnly;
+    if (!replayed) {
       currentTaskTitle = result.desktop?.taskTitle || createdThread.title;
       currentStopCandidates = result.mode === "desktop"
         ? (Number(result.desktop?.stopCandidates) || 1)
@@ -2271,7 +2322,7 @@ async function createNewTask() {
     } else {
       desktopDispatchState = undefined;
     }
-    managedRun = result.mode === "background" ? result.run : undefined;
+    managedRun = !replayed && result.mode === "background" ? result.run : undefined;
     managedRenderSignature = "";
     localStorage.setItem(SELECTED_THREAD_KEY, createdThread.id);
     newTaskAttachments = [];
@@ -2284,9 +2335,10 @@ async function createNewTask() {
     updateComposerState();
     window.setTimeout(refreshStatus, 600);
   } catch {
-    elements.newTaskError.textContent = bridgeCapabilities.nativeTextSend
+    elements.newTaskError.textContent = usesDeliveryReceipts
       ? "创建或发送回执超时，草稿与请求编号已保留；请先核对列表，同样内容重试不会重复创建或发送。"
       : "无法连接电脑，请稍后重试。";
+    if (usesMacReceipts) elements.newTaskError.textContent += macDeliveryDiagnostic("create");
   } finally {
     window.clearTimeout(requestTimeout);
     isCreatingTask = false;
@@ -3024,6 +3076,12 @@ function appendTurnHistory(turn, groupKey, target = elements.threadHistory) {
   const appendWorked = () => {
     if (workedAppended) return;
     appendWorkedGroup(workedItems, turn, groupKey, target);
+    if (turn.itemsTruncated && Number(turn.omittedItemCount) > 0) {
+      const notice = document.createElement("p");
+      notice.className = "history-label";
+      notice.textContent = `另有 ${Math.floor(Number(turn.omittedItemCount))} 条记录未显示，完整内容可在 Desktop 查看。`;
+      target.append(notice);
+    }
     workedAppended = true;
   };
   for (let index = 0; index < items.length; index += 1) {
@@ -3154,36 +3212,46 @@ function cachedThreadDetail(summary, turnLimit) {
 
 function persistSessionThreadDetail(entry) {
   const turns = Array.isArray(entry.thread?.turns) ? entry.thread.turns : [];
-  let retainedTurns = turns;
-  let complete = entry.complete !== false;
-  let serialized = "";
-  do {
-    const thread = {
-      ...entry.thread,
-      turns: retainedTurns,
-    };
-    if (retainedTurns.length !== turns.length) {
-      complete = false;
-      delete thread.historyCursor;
-      delete thread.historyNextCursor;
-    }
-    serialized = JSON.stringify({
-      version: 1,
-      ...entry,
-      complete,
-      turnLimit: complete
-        ? entry.turnLimit
-        : Math.min(entry.turnLimit, retainedTurns.length),
-      thread,
-    });
-    if (serialized.length <= THREAD_SESSION_CACHE_MAX_CHARS) break;
-    retainedTurns = retainedTurns.slice(1);
-  } while (retainedTurns.length);
   try {
-    if (serialized && serialized.length <= THREAD_SESSION_CACHE_MAX_CHARS) {
+    // Select the tail in one linear pass. Re-serializing the entire history
+    // after removing each turn makes a large paged history quadratic.
+    const { fetchedAt, ...stableEntry } = entry;
+    const cachedThread = { ...entry.thread, turns: [] };
+    const cachedEntry = {
+      version: 1, ...stableEntry, complete: entry.complete !== false, thread: cachedThread,
+    };
+    const timestamp = JSON.stringify({ fetchedAt }).slice(1, -1);
+    const timestampLength = timestamp ? timestamp.length + 1 : 0;
+    const lengths = turns.map((turn) => JSON.stringify(turn).length);
+    let turnsLength = lengths.reduce((total, length) => total + length, 0)
+      + Math.max(0, lengths.length - 1);
+    let metadataLength = JSON.stringify(cachedEntry).length + timestampLength;
+    let first = 0;
+    if (metadataLength + turnsLength > THREAD_SESSION_CACHE_MAX_CHARS) {
+      cachedEntry.complete = false;
+      delete cachedThread.historyCursor;
+      delete cachedThread.historyNextCursor;
+      metadataLength = JSON.stringify(cachedEntry).length + timestampLength;
+      while (first < turns.length && metadataLength + turnsLength > THREAD_SESSION_CACHE_MAX_CHARS) {
+        turnsLength -= lengths[first] + (first + 1 < turns.length ? 1 : 0);
+        first += 1;
+      }
+      cachedEntry.turnLimit = Math.min(entry.turnLimit, turns.length - first);
+    }
+    cachedThread.turns = turns.slice(first);
+    const stablePayload = JSON.stringify(cachedEntry);
+    // fetchedAt changes on every successful poll; unchanged content does not
+    // need another synchronous Web Storage write. Its saved TTL stays honest.
+    if (stablePayload === persistedThreadSessionPayload) return;
+    const serialized = timestamp
+      ? `${stablePayload.slice(0, -1)},${timestamp}}`
+      : stablePayload;
+    if (serialized.length <= THREAD_SESSION_CACHE_MAX_CHARS && (!turns.length || first < turns.length)) {
       sessionStorage.setItem(THREAD_SESSION_CACHE_KEY, serialized);
+      persistedThreadSessionPayload = stablePayload;
     } else {
       sessionStorage.removeItem(THREAD_SESSION_CACHE_KEY);
+      persistedThreadSessionPayload = "";
     }
   } catch {
     // The in-memory cache still keeps the current page usable.
@@ -3267,12 +3335,12 @@ async function loadOlderHistory(threadId) {
   if (selectedThread?.id === threadId) renderHistoryNotice(cached.thread, cached.turnLimit);
   try {
     const query = new URLSearchParams({ turns: String(INITIAL_HISTORY_TURNS), historyBefore: cursor });
-    const response = await fetch(`/api/codex/threads/${encodeURIComponent(threadId)}?${query}`, {
+    const { response, result } = await fetchJSONWithTimeout(`/api/codex/threads/${encodeURIComponent(threadId)}?${query}`, {
       headers: authorizationHeaders(), cache: "no-store",
     });
     if (response.status === 401) { handleUnauthorized(); return; }
     if (!response.ok) throw new Error("older history read failed");
-    const older = (await response.json()).thread;
+    const older = result.thread;
     const latest = threadHistoryCache.get(threadId);
     if (!older?.historyPaged || !latest || latest.thread.historyNextCursor !== cursor) return;
     const thread = prependHistoryPage(latest.thread, older);
@@ -3818,47 +3886,64 @@ function renderManagedRun() {
 
 async function refreshManagedRun(threadId = selectedThread?.id) {
   if (!threadId || threadId !== selectedThread?.id || !deviceToken) return;
-  try {
-    const response = await fetch(
-      `/api/codex/threads/${encodeURIComponent(threadId)}/run`,
-      { headers: authorizationHeaders(), cache: "no-store" },
-    );
-    if (response.status === 401) {
-      handleUnauthorized();
-      return;
-    }
-    if (!response.ok) throw new Error("managed run failed");
-    const result = await response.json();
-    if (threadId !== selectedThread?.id) return;
-    const previous = managedRun?.threadId === threadId ? managedRun : undefined;
-    managedRun = result.run;
-    renderManagedRun();
-    updateComposerState();
-    if (
-      previous
-      && managedRun
-      && managedRun.turnId
-      && managedRunIsActive(previous)
-      && !managedRunIsActive(managedRun)
-      && !completedRunsSeen.has(managedRun.turnId)
-    ) {
-      completedRunsSeen.add(managedRun.turnId);
-      await new Promise((resolve) => window.setTimeout(resolve, 300));
-      await openThread(threadId, { refreshRun: false, fresh: true });
+  if (managedRunRefreshes.has(threadId)) return managedRunRefreshes.get(threadId);
+  const requestVersion = (managedRunRequestVersions.get(threadId) || 0) + 1;
+  managedRunRequestVersions.set(threadId, requestVersion);
+  const baseline = managedRun;
+  const stillCurrent = () => threadId === selectedThread?.id
+    && managedRunRequestVersions.get(threadId) === requestVersion;
+  const refresh = (async () => {
+    try {
+      const { response, result } = await fetchJSONWithTimeout(
+        `/api/codex/threads/${encodeURIComponent(threadId)}/run`,
+        { headers: authorizationHeaders(), cache: "no-store" },
+      );
+      if (response.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      if (!response.ok) throw new Error("managed run failed");
+      // A send/stop or a thread switch may have changed state during this read.
+      if (!stillCurrent() || managedRun !== baseline) return;
+      const previous = managedRun?.threadId === threadId ? managedRun : undefined;
       managedRun = result.run;
       renderManagedRun();
       updateComposerState();
-      if (!persistedManagedTurnIds.has(managedRun.turnId)) {
-        window.setTimeout(() => {
-          if (selectedThread?.id === threadId && !managedRunIsActive()) {
-            openThread(threadId, { refreshRun: false, fresh: true, scroll: false });
-          }
-        }, 1_200);
+      if (
+        previous
+        && managedRun?.turnId
+        && managedRunIsActive(previous)
+        && !managedRunIsActive(managedRun)
+        && !completedRunsSeen.has(managedRun.turnId)
+      ) {
+        const completed = managedRun;
+        completedRunsSeen.add(completed.turnId);
+        await new Promise((resolve) => window.setTimeout(resolve, 300));
+        if (!stillCurrent() || managedRun !== completed) return;
+        await openThread(threadId, { refreshRun: false, fresh: true });
+        if (!stillCurrent() || managedRun !== completed) return;
+        renderManagedRun();
+        updateComposerState();
+        if (!persistedManagedTurnIds.has(completed.turnId)) {
+          window.setTimeout(() => {
+            if (stillCurrent() && managedRun === completed) {
+              openThread(threadId, { refreshRun: false, fresh: true, scroll: false });
+            }
+          }, 1_200);
+        }
+      }
+    } catch {
+      if (stillCurrent() && managedRunIsActive()) {
+        elements.composerState.textContent = "后台状态暂时不可用，正在重试…";
       }
     }
-  } catch {
-    if (managedRunIsActive()) {
-      elements.composerState.textContent = "后台状态暂时不可用，正在重试…";
+  })();
+  managedRunRefreshes.set(threadId, refresh);
+  try {
+    return await refresh;
+  } finally {
+    if (managedRunRefreshes.get(threadId) === refresh) {
+      managedRunRefreshes.delete(threadId);
     }
   }
 }
@@ -3866,6 +3951,66 @@ async function refreshManagedRun(threadId = selectedThread?.id) {
 function nativeMessageIdentity(message, attachments = []) {
   // Retain the previous text-only digest for in-flight requests after upgrade.
   return attachments.length ? JSON.stringify([message, attachments.map(item => item.id)]) : message;
+}
+
+function macDeliveryIdentity(scope, payload) {
+  const content = [payload.message || "", payload.attachmentIds || []];
+  return JSON.stringify(scope === "create"
+    ? [...content, payload.projectId || null, payload.model || null, payload.effort || null, payload.serviceTier || null]
+    : content);
+}
+
+function rememberMacDelivery(scope, payload) {
+  // Keep the original submission only while its outcome is unresolved. Edits
+  // must query that receipt without replacing the reader's current draft.
+  sessionStorage.setItem(`pocket-mac-pending:${scope}`, JSON.stringify({
+    identity: macDeliveryIdentity(scope, payload), body: payload,
+  }));
+}
+
+function forgetMacDelivery(scope) {
+  sessionStorage.removeItem(`pocket-mac-pending:${scope}`);
+  sessionStorage.removeItem(`pocket-native-delivery:${scope}`);
+}
+
+function macDeliveryDiagnostic(scope) {
+  try {
+    const pending = JSON.parse(sessionStorage.getItem(`pocket-mac-pending:${scope}`) || "null");
+    const requestId = pending?.body?.requestId;
+    if (typeof requestId !== "string" || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(requestId)) return "";
+    return ` 请求编号：${requestId}；范围：${String(scope).slice(0, 128)}。`;
+  } catch {
+    return "";
+  }
+}
+
+async function prepareMacDelivery(scope, payload) {
+  let pending;
+  try { pending = JSON.parse(sessionStorage.getItem(`pocket-mac-pending:${scope}`) || "null"); }
+  catch { pending = undefined; }
+  const identity = macDeliveryIdentity(scope, payload);
+  if (pending?.body?.requestId && pending.identity !== identity) {
+    const url = scope === "create" ? "/api/codex/threads"
+      : `/api/codex/threads/${encodeURIComponent(scope)}/turn`;
+    const { response, result } = await nativeDeliveryResponse(url, {
+      method: "POST",
+      headers: { ...authorizationHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ ...pending.body, receiptOnly: true }),
+    });
+    if (response.status === 401) {
+      handleUnauthorized();
+      return { blocked: true, feedback: "请先恢复设备配对；上次请求与当前草稿均已保留" };
+    }
+    const resolved = result?.delivery?.requestId === pending.body.requestId
+      && ((response.ok && result.ok === true) || result.retryAllowed === true);
+    if (resolved) forgetMacDelivery(scope);
+    return { blocked: true, feedback: resolved
+      ? "上次请求已核对，当前新草稿已保留；请再次点击以提交新草稿"
+      : "上次请求仍待确认，本次只核对原回执；当前新草稿已保留，未重新发送" };
+  }
+  const requestId = await nativeDeliveryRequestId(scope, identity, pending?.body?.requestId);
+  rememberMacDelivery(scope, { ...payload, requestId });
+  return { requestId };
 }
 
 async function nativeDeliveryRequestId(threadId, message, inheritedId = undefined) {
@@ -3885,10 +4030,12 @@ async function nativeDeliveryResponse(url, options, timeoutMs = 45_000, onPendin
   // replay ordinary delivery, Resume, or a creation without its durable ID.
   let payload;
   try { payload = JSON.parse(options.body); } catch { payload = null; }
-  const canPoll = typeof bridgeCapabilities !== 'undefined' && bridgeCapabilities.nativeReceiptPolling
+  const canPoll = typeof bridgeCapabilities !== 'undefined'
+    && (bridgeCapabilities.nativeReceiptPolling || bridgeCapabilities.deliveryReceipts)
     && options.method === 'POST' && typeof payload?.requestId === 'string'
     && (url === '/api/codex/threads' || /^\/api\/codex\/threads\/[^/]+\/turn$/.test(url));
-  const pendingErrors = new Set(['native_delivery_uncertain', 'native_create_uncertain', 'native_receipt_pending']);
+  const pendingErrors = new Set(['native_delivery_uncertain', 'native_create_uncertain', 'native_receipt_pending',
+    'delivery_uncertain', 'delivery_receipt_pending']);
   const deadline = Date.now() + 90_000;
   let last, failure;
   for (let attempt = 0; attempt <= (canPoll ? 8 : 0); attempt++) {
@@ -3953,15 +4100,31 @@ async function startManagedTurn({ continueOnly = false } = {}) {
   }
   const threadId = selectedThread.id;
   const baselineTurnId = selectedThreadLastTurnId;
+  const usesDeliveryReceipts = bridgeCapabilities.nativeTextSend
+    || (bridgeCapabilities.deliveryReceipts && !continueOnly);
+  const usesMacReceipts = bridgeCapabilities.deliveryReceipts
+    && !bridgeCapabilities.nativeTextSend && !continueOnly;
   let feedback = "";
   nativeDeliveryNotices.delete(threadId);
   isSendingMessage = true;
   updateComposerState();
   try {
-    const requestId = bridgeCapabilities.nativeTextSend
-      ? await nativeDeliveryRequestId(threadId, continueOnly ? `resume:${baselineTurnId}` : nativeMessageIdentity(message, attachments)) : undefined;
+    let requestId;
+    if (usesMacReceipts) {
+      const prepared = await prepareMacDelivery(threadId, {
+        message, attachmentIds: attachments.map(attachment => attachment.id),
+      });
+      if (prepared.blocked) {
+        feedback = prepared.feedback;
+        return;
+      }
+      requestId = prepared.requestId;
+    } else if (usesDeliveryReceipts) {
+      requestId = await nativeDeliveryRequestId(threadId,
+        continueOnly ? `resume:${baselineTurnId}` : nativeMessageIdentity(message, attachments));
+    }
     let nativeResult;
-    const sendRequest = bridgeCapabilities.nativeTextSend
+    const sendRequest = usesDeliveryReceipts
       ? async (url, options) => {
         const received = await nativeDeliveryResponse(url, options, 45_000, () => {
           if (selectedThread?.id === threadId) elements.composerState.textContent = "等待 Desktop 回执…正在自动核对，不会重复发送";
@@ -3989,10 +4152,13 @@ async function startManagedTurn({ continueOnly = false } = {}) {
       handleUnauthorized();
       return;
     }
-    const result = bridgeCapabilities.nativeTextSend ? nativeResult : await response.json();
+    const result = usesDeliveryReceipts ? nativeResult : await response.json();
     if (!response.ok) {
+      if (usesDeliveryReceipts && result.retryAllowed === true) {
+        sessionStorage.removeItem(`pocket-native-delivery:${threadId}`);
+        if (usesMacReceipts) forgetMacDelivery(threadId);
+      }
       if (bridgeCapabilities.nativeTextSend) {
-        if (result.retryAllowed === true) sessionStorage.removeItem(`pocket-native-delivery:${threadId}`);
         const known = {
           native_desktop_draft_present: "Windows 输入框已有草稿，已保留，没有发送",
           native_desktop_locked_or_unavailable: "Windows 已锁屏或桌面不可用，没有发送",
@@ -4032,6 +4198,14 @@ async function startManagedTurn({ continueOnly = false } = {}) {
         feedback = known[result.error] || (result.retryAllowed === true
           ? "Windows 未通过发送前检查，没有发送；请检查桌面状态"
           : "发送结果待确认，请勿重复发送。可刷新历史，或用同一条消息重试以核对收件（不会再次点击发送）。");
+        return;
+      }
+      if (result.error === "delivery_manually_refused") {
+        feedback = "上次请求已由电脑端解除待确认；草稿已保留，重新发送需再次点击";
+        return;
+      }
+      if (["delivery_uncertain", "delivery_receipt_pending", "delivery_confirmation_pending"].includes(result.error)) {
+        feedback = "发送结果待确认，草稿与请求编号已保留；可刷新历史，或用同样内容重试核对回执，不会重复发送";
         return;
       }
       if (result.error === "desktop_turn_active") {
@@ -4129,16 +4303,22 @@ async function startManagedTurn({ continueOnly = false } = {}) {
       }
       throw new Error("managed turn start failed");
     }
-    if (bridgeCapabilities.nativeTextSend) {
-      if (result.ok !== true || result.mode !== "desktop" || result.desktop?.ok !== true
-          || result.desktop.confirmedBy !== "threadHistory") {
+    if (usesDeliveryReceipts) {
+      if (bridgeCapabilities.nativeTextSend && (result.ok !== true || result.mode !== "desktop"
+          || result.desktop?.ok !== true || result.desktop.confirmedBy !== "threadHistory")) {
         throw new Error("native_receipt_missing");
       }
-      if (result.desktop.duplicateRequest === true && !result.desktop.receiptPolled) {
+      if (!bridgeCapabilities.nativeTextSend
+          && (result.ok !== true || result.delivery?.requestId !== requestId)) {
+        throw new Error("delivery_receipt_missing");
+      }
+      if ((result.desktop?.duplicateRequest === true && !result.desktop.receiptPolled)
+          || (result.delivery?.replayed === true && !result.delivery.receiptOnly)) {
         // This acknowledges an OLD request, not a newly started turn. Keep
         // the draft, retire the confirmed ID, and require another explicit tap
         // for a genuinely new delivery of identical text. Never auto-resend.
         sessionStorage.removeItem(`pocket-native-delivery:${threadId}`);
+        if (usesMacReceipts) forgetMacDelivery(threadId);
         feedback = continueOnly
           ? "此前的继续请求已确认，本次没有重复点击；正在核对任务状态。"
           : "上一条已送达，本次没有再次发送。文字已保留；要新发一条相同内容，请再点发送。";
@@ -4153,7 +4333,8 @@ async function startManagedTurn({ continueOnly = false } = {}) {
     }
     if (continueOnly && bridgeCapabilities.nativeTextSend) sessionStorage.removeItem(`pocket-native-delivery:${threadId}`);
     if (!continueOnly) {
-      if (bridgeCapabilities.nativeTextSend) sessionStorage.removeItem(`pocket-native-delivery:${threadId}`);
+      if (usesDeliveryReceipts) sessionStorage.removeItem(`pocket-native-delivery:${threadId}`);
+      if (usesMacReceipts) forgetMacDelivery(threadId);
       threadDrafts.delete(threadId);
       threadAttachments.delete(threadId);
       if (selectedThread?.id === threadId) {
@@ -4166,7 +4347,7 @@ async function startManagedTurn({ continueOnly = false } = {}) {
     // A slow response belongs to the submitted task, not whichever task the
     // reader has since opened. Never clear its draft or navigate back to A.
     if (selectedThread?.id !== threadId) return;
-    if (result.desktop?.receiptPolled) {
+    if (result.desktop?.receiptPolled || result.delivery?.receiptOnly) {
       feedback = "Desktop 已收到消息";
       // The turn may already be completed. Read actual history instead of
       // painting a new running state merely because its receipt arrived late.
@@ -4205,12 +4386,12 @@ async function startManagedTurn({ continueOnly = false } = {}) {
       renderManagedRun();
     }
   } catch {
-    feedback = bridgeCapabilities.nativeTextSend
+    feedback = usesDeliveryReceipts
       ? "收件确认超时或连接中断，结果待确认；已保留消息，请先刷新历史，不要重复发送。"
       : continueOnly
-      ? "继续失败，没有启动任务"
-      : "发送失败，没有启动新任务";
-    if (bridgeCapabilities.nativeTextSend) {
+      ? "继续结果暂未确认，请先刷新历史，避免重复操作"
+      : "发送结果暂未确认，请先刷新历史，避免重复发送";
+    if (usesDeliveryReceipts) {
       // Schedule after finally releases the composer. Read-only refresh; no
       // navigation back to a previous task and no automatic delivery retry.
       window.setTimeout(() => selectedThread?.id === threadId && openThread(threadId, {
@@ -4221,7 +4402,9 @@ async function startManagedTurn({ continueOnly = false } = {}) {
   } finally {
     isSendingMessage = false;
     updateComposerState();
-    if (feedback && selectedThread?.id === threadId) elements.composerState.textContent = feedback;
+    if (feedback && selectedThread?.id === threadId) {
+      elements.composerState.textContent = feedback + (usesMacReceipts ? macDeliveryDiagnostic(threadId) : "");
+    }
   }
 }
 
@@ -4270,6 +4453,10 @@ async function openThread(threadId, options = {}) {
   const isThreadSwitch = selectedThread?.id !== threadId;
   if (selectedThread?.id) {
     threadDrafts.set(selectedThread.id, elements.composerInput.value);
+    if (isThreadSwitch) {
+      managedRunRequestVersions.set(selectedThread.id,
+        (managedRunRequestVersions.get(selectedThread.id) || 0) + 1);
+    }
   }
   selectedThread = summary;
   const wasUnread = summary.isUnread === true;
@@ -4361,7 +4548,7 @@ async function openThread(threadId, options = {}) {
       query.set("tailRevision", String(cursor.revision));
     }
     const fetchDetail = async () => {
-      const response = await fetch(
+      const { response, result } = await fetchJSONWithTimeout(
         `/api/codex/threads/${encodeURIComponent(threadId)}?${query}`,
         { headers: authorizationHeaders(), cache: "no-store" },
       );
@@ -4370,7 +4557,7 @@ async function openThread(threadId, options = {}) {
         return undefined;
       }
       if (!response.ok) throw new Error("thread read failed");
-      return (await response.json()).thread;
+      return result.thread;
     };
     const requestVersion = (historyRequestVersions.get(threadId) || 0) + 1;
     historyRequestVersions.set(threadId, requestVersion);
@@ -4437,7 +4624,7 @@ async function loadThreads() {
     let result;
     for (let attempt = 0; attempt < 3 && !result; attempt += 1) {
       try {
-        const response = await fetch("/api/codex/threads?limit=50", {
+        const { response, result: candidate } = await fetchJSONWithTimeout("/api/codex/threads?limit=50", {
           headers: authorizationHeaders(),
           cache: "no-store",
         });
@@ -4446,7 +4633,6 @@ async function loadThreads() {
           return;
         }
         if (!response.ok) throw new Error("thread list failed");
-        const candidate = await response.json();
         if (!Array.isArray(candidate.projects) || !Array.isArray(candidate.threads)) {
           throw new Error("invalid thread list");
         }
@@ -4518,7 +4704,7 @@ async function refreshStatusOnce() {
       showTokenDialog();
       return;
     }
-    const response = await fetch("/api/desktop/interrupt/status", {
+    const { response, result: status } = await fetchJSONWithTimeout("/api/desktop/interrupt/status", {
       headers: authorizationHeaders(),
       cache: "no-store",
     });
@@ -4527,11 +4713,10 @@ async function refreshStatusOnce() {
       return;
     }
     if (!response.ok) {
-      const failure = await response.json().catch(() => ({}));
+      const failure = status;
       if (failure?.error === "accessibility_probe_failed") failureReason = failure.reason;
       throw new Error("status failed");
     }
-    const status = await response.json();
     applyBridgeCapabilities(status.capabilities);
     const previousTitle = currentTaskTitle;
     const previousStopCandidates = currentStopCandidates;
@@ -4909,6 +5094,54 @@ elements.tokenForm.addEventListener("submit", (event) => {
   Promise.all([refreshStatus(), loadThreads()]);
 });
 
+function startPolling() {
+  if (refreshTimer !== undefined) return;
+  refreshTimer = window.setInterval(refreshStatus, 3000);
+  managedPollTimer = window.setInterval(() => {
+    if (managedRunIsActive()) refreshManagedRun();
+  }, 900);
+  desktopHistoryPollTimer = window.setInterval(refreshDesktopConversationIfRunning, 5_000);
+  drawerStatusPollTimer = window.setInterval(() => {
+    if (elements.projectDrawer.classList.contains("open") || notificationsEnabled) {
+      refreshDrawerThreadStates();
+    }
+    if (elements.projectDrawer.classList.contains("open")) {
+      refreshUsage();
+      refreshSystemMetrics();
+    }
+  }, 10_000);
+}
+
+function stopPolling() {
+  window.clearInterval(refreshTimer);
+  window.clearInterval(managedPollTimer);
+  window.clearInterval(desktopHistoryPollTimer);
+  window.clearInterval(drawerStatusPollTimer);
+  refreshTimer = managedPollTimer = desktopHistoryPollTimer = drawerStatusPollTimer = undefined;
+}
+
+function refreshVisiblePage() {
+  if (document.visibilityState !== "visible") return;
+  startPolling();
+  refreshStatus();
+  if (selectedThread && !desktopHistoryRefreshInFlight) {
+    desktopHistoryRefreshInFlight = true;
+    openThread(selectedThread.id, {
+      fresh: true,
+      scroll: false,
+      refreshRun: false,
+      rerenderProjects: false,
+      closeDrawer: false,
+    }).finally(() => {
+      desktopHistoryRefreshInFlight = false;
+    });
+    refreshManagedRun();
+  }
+  if (elements.projectDrawer.classList.contains("open") || notificationsEnabled) {
+    refreshDrawerThreadStates();
+  }
+}
+
 renderNotificationState();
 registerNotificationWorker().catch(() => {
   if (notificationsEnabled) {
@@ -4917,23 +5150,7 @@ registerNotificationWorker().catch(() => {
   }
 });
 Promise.all([refreshStatus(), loadThreads()]);
-refreshTimer = window.setInterval(refreshStatus, 3000);
-managedPollTimer = window.setInterval(() => {
-  if (managedRunIsActive()) refreshManagedRun();
-}, 900);
-desktopHistoryPollTimer = window.setInterval(
-  refreshDesktopConversationIfRunning,
-  5_000,
-);
-drawerStatusPollTimer = window.setInterval(() => {
-  if (elements.projectDrawer.classList.contains("open") || notificationsEnabled) {
-    refreshDrawerThreadStates();
-  }
-  if (elements.projectDrawer.classList.contains("open")) {
-    refreshUsage();
-    refreshSystemMetrics();
-  }
-}, 10_000);
+startPolling();
 elements.scrollRail.addEventListener("pointerdown", startScrollDrag);
 elements.scrollRail.addEventListener("pointermove", moveScrollDrag);
 elements.scrollRail.addEventListener("pointerup", endScrollDrag);
@@ -4947,25 +5164,9 @@ window.addEventListener("resize", () => {
   scheduleScrollHandle();
   updateLatestButton();
 });
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "visible") return;
-  refreshStatus();
-  if (selectedThread && !desktopHistoryRefreshInFlight) {
-    desktopHistoryRefreshInFlight = true;
-    openThread(selectedThread.id, {
-      fresh: true,
-      scroll: false,
-      refreshRun: false,
-      rerenderProjects: false,
-      closeDrawer: false,
-    }).finally(() => {
-      desktopHistoryRefreshInFlight = false;
-    });
-  }
-  if (elements.projectDrawer.classList.contains("open")) {
-    refreshDrawerThreadStates();
-  }
-});
+document.addEventListener("visibilitychange", refreshVisiblePage);
+window.addEventListener("pageshow", refreshVisiblePage);
+window.addEventListener("online", refreshVisiblePage);
 navigator.serviceWorker?.addEventListener("message", (event) => {
   if (event.data?.type !== "open-thread" || typeof event.data.threadId !== "string") {
     return;
@@ -4996,9 +5197,4 @@ if (window.ResizeObserver) {
   layoutObserver.observe(elements.composerShell);
 }
 scheduleScrollHandle();
-window.addEventListener("pagehide", () => {
-  window.clearInterval(refreshTimer);
-  window.clearInterval(managedPollTimer);
-  window.clearInterval(desktopHistoryPollTimer);
-  window.clearInterval(drawerStatusPollTimer);
-});
+window.addEventListener("pagehide", stopPolling);

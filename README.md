@@ -2,6 +2,8 @@
 
 [English](README.en.md)
 
+此 fork 基于 [JarvisPei/codex-pocket](https://github.com/JarvisPei/codex-pocket)，包含缓存、历史刷新、连接恢复与 Mac 发送回执优化，详见 [优化记录与实测范围](docs/PERFORMANCE_AND_RELIABILITY.md)。
+
 在手机、平板或其他现代浏览器中查看和控制电脑上的 Codex Desktop，同时让 Desktop 保持任务的真正执行者。
 
 Codex Pocket 在电脑本机运行一个窄接口 Bridge，通过 Tailscale Serve 暴露给自己的 tailnet。手机不需要登录 ChatGPT，也不会获得 Codex 凭据、通用终端或远程桌面权限。
@@ -71,7 +73,7 @@ MacBook 需要长期锁屏或合盖远程运行时，推荐安装免费的 [Amph
 ## 安装 Bridge
 
 ```sh
-git clone https://github.com/JarvisPei/codex-pocket.git
+git clone https://github.com/zzq96/codex-pocket.git
 cd codex-pocket
 zsh scripts/install-mac-bridge-launch-agent.sh
 ```
@@ -173,10 +175,13 @@ python3 scripts/manage-bridge-devices.py revoke <device-id>
 ## 测试
 
 ```sh
-python3 -m unittest tests.test_mac_bridge
+python3 -m unittest discover -s tests -v
+node --test tests/test_web_*.cjs
 ```
 
 当前测试覆盖设备配对、附件归属与路径保护、Project/Recents 归属、Desktop 发送与停止、历史序列化、活动分组、模型设置、Usage、新建任务和失败保护。
+
+本轮还补充了缓存、长历史、读取连接恢复、Mac 持久发送回执、浏览器恢复与热点连接复用的回归检查。改动说明、可重复基准、健康检查与待确认回执的恢复步骤见 [性能与稳定性优化记录](docs/PERFORMANCE_AND_RELIABILITY.md)。
 
 ## 当前限制
 
